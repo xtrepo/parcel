@@ -303,6 +303,7 @@ type Async<T> = T | Promise<T>;
 export type Transformer = {
   getConfig?: (
     asset: MutableAsset,
+    resolve: (from: FilePath, to: string) => Promise<FilePath>,
     opts: ParcelOptions
   ) => Async<Config | void>,
   canReuseAST?: (ast: AST, opts: ParcelOptions) => boolean,
