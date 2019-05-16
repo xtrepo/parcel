@@ -61,11 +61,16 @@ export default class BundlerRunner {
       bundles.map(bundle => this.nameBundle(namers, bundle, bundleGraph))
     );
 
-    let bundlePaths = bundles.map(b => b.filePath);
+    let bundleNames = bundles.map(
+      b =>
+        nullthrows(b.target).name +
+        ':' +
+        normalizeSeparators(nullthrows(b.name))
+    );
     assert.deepEqual(
-      bundlePaths,
-      unique(bundlePaths),
-      'Bundles must have unique filePaths'
+      bundleNames,
+      unique(bundleNames),
+      'Bundles must have unique names within their targets'
     );
   }
 
