@@ -179,6 +179,8 @@ export default class Parcel {
           {ignore}
         );
 
+        this.#reporterRunner.report({type: 'watchStart'});
+
         return this.build();
       })().catch(err => {
         this.#watchErrors.emit(err);
@@ -198,6 +200,7 @@ export default class Parcel {
 
         this.#watcherCount--;
         if (this.#watcherCount === 0) {
+          await this.#reporterRunner.report({type: 'watchEnd'});
           await this.#watcherSubscription.unsubscribe();
         }
       }

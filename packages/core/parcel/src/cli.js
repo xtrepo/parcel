@@ -143,7 +143,11 @@ async function run(entries: Array<string>, command: any) {
   });
 
   if (command.name() === 'watch' || command.name() === 'serve') {
-    parcel.watch();
+    parcel.watch(err => {
+      if (err) {
+        throw err;
+      }
+    });
   } else {
     try {
       await parcel.run();
