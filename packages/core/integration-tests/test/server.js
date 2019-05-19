@@ -2,7 +2,7 @@ const assert = require('assert');
 const path = require('path');
 const fs = require('@parcel/fs');
 const logger = require('@parcel/logger');
-const {bundler, sleep} = require('@parcel/test-utils');
+const {bundler} = require('@parcel/test-utils');
 const http = require('http');
 const https = require('https');
 const getPort = require('get-port');
@@ -120,15 +120,26 @@ describe('server', function() {
       watch: true
     });
 
-    await b.run();
+    let disposable = b.watch();
 
-    await sleep(10000);
+    // Wait for the first build to complete.
+    await new Promise(resolve => {
+      let disposable = b.onBuild(event => {
+        resolve(event);
+        disposable.dispose();
+      });
+    });
+
     await fs.writeFile(path.join(inputDir, 'local.js'), 'syntax\\error');
 
-    // TODO: Programatically wait for an error to occur, or time out. Right now,
-    //       Parcel does not expose this without creating a reporter that must
-    //       be loaded from disk.
-    await sleep(10000);
+    // Await the second build failing (which means resolving with
+    // a buildFailure event)
+    await new Promise(resolve => {
+      let disposable = b.onBuild(event => {
+        resolve(event);
+        disposable.dispose();
+      });
+    });
 
     let statusCode = 200;
     try {
@@ -136,6 +147,8 @@ describe('server', function() {
     } catch (err) {
       statusCode = err.statusCode;
       assert(err.data.includes('Expecting Unicode escape sequence'));
+    } finally {
+      disposable.dispose();
     }
 
     assert.equal(statusCode, 500);

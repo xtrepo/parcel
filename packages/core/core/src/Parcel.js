@@ -1,6 +1,13 @@
 // @flow
 
-import type {InitialParcelOptions, ParcelOptions, Stats} from '@parcel/types';
+import type {
+  BuildFailureEvent,
+  BuildSuccessEvent,
+  InitialParcelOptions,
+  ParcelOptions,
+  Stats,
+  Subscription
+} from '@parcel/types';
 import type {Bundle} from './types';
 import type InternalBundleGraph from './BundleGraph';
 
@@ -19,6 +26,9 @@ import ReporterRunner from './ReporterRunner';
 import MainAssetGraph from './public/MainAssetGraph';
 import dumpGraphToGraphViz from './dumpGraphToGraphViz';
 import resolveOptions from './resolveOptions';
+import {ValueEmitter} from '@parcel/events';
+
+type BuildEvent = BuildFailureEvent | BuildSuccessEvent;
 
 export default class Parcel {
   #assetGraphBuilder; // AssetGraphBuilder
@@ -27,12 +37,17 @@ export default class Parcel {
   #initialized = false; // boolean
   #initialOptions; // InitialParcelOptions;
   #reporterRunner; // ReporterRunner
-  #resolvedOptions; // ?ParcelOptions
+  #resolvedOptions = null; // ?ParcelOptions
   #runPackage; // (bundle: Bundle, bundleGraph: InternalBundleGraph) => Promise<Stats>;
-  #watcher;
+  #buildEvents; // : ValueEmitter<BuildEvent>;
+  #watchErrors; // : ValueEmitter<mixed>;
+  #watcherSubscription; // AyncSubscription
+  #watcherCount = 0; // number
 
   constructor(options: InitialParcelOptions) {
     this.#initialOptions = clone(options);
+    this.#buildEvents = new ValueEmitter<BuildEvent>();
+    this.#watchErrors = new ValueEmitter<mixed>();
   }
 
   async init(): Promise<void> {
@@ -94,42 +109,6 @@ export default class Parcel {
     );
 
     this.#runPackage = this.#farm.mkhandle('runPackage');
-
-    await this.initializeWatcher();
-  }
-
-  async initializeWatcher() {
-    let projectRoot = this.#resolvedOptions.projectRoot;
-    if (this.#resolvedOptions.watch) {
-      // TODO: ideally these should all be absolute paths already set up on #resolvedOptions
-      let targetDirs = this.#resolvedOptions.targets.map(target =>
-        path.resolve(process.cwd(), target.distDir)
-      );
-      let cacheDir = path.resolve(
-        process.cwd(),
-        this.#resolvedOptions.cacheDir
-      );
-      let vcsDirs = ['.git', '.hg'].map(dir => path.join(projectRoot, dir));
-      let ignore = [cacheDir, ...targetDirs, ...vcsDirs];
-      this.#watcher = await watcher.subscribe(
-        projectRoot,
-        (err, events) => {
-          if (err) {
-            throw err;
-          }
-
-          this.#assetGraphBuilder.respondToFSEvents(events);
-          if (this.#assetGraphBuilder.isInvalid()) {
-            this.build().catch(() => {
-              // Do nothing, in watch mode reporters should alert the user something is broken, which
-              // allows Parcel to gracefully continue once the user makes the correct changes
-            });
-          }
-        },
-        {ignore}
-      );
-    }
-
     this.#initialized = true;
   }
 
@@ -140,17 +119,89 @@ export default class Parcel {
       await this.init();
     }
 
+    let bundleGraph = await this.build();
+
     let resolvedOptions = nullthrows(this.#resolvedOptions);
-    try {
-      let graph = await this.build();
-      if (!resolvedOptions.watch) {
-        return graph;
-      }
-    } catch (e) {
-      if (!resolvedOptions.watch) {
-        throw e;
-      }
+    if (resolvedOptions.killWorkers !== false) {
+      await this.#farm.end();
     }
+
+    return bundleGraph;
+  }
+
+  watch(cb?: (err: ?mixed, buildEvent?: BuildEvent) => mixed): Subscription {
+    let buildEventsDisposable;
+    let watchErrorsDisposable;
+    if (cb) {
+      buildEventsDisposable = this.#buildEvents.addListener(buildEvent =>
+        nullthrows(cb)(null, buildEvent)
+      );
+      watchErrorsDisposable = this.#watchErrors.addListener(err =>
+        nullthrows(cb)(err)
+      );
+    }
+
+    if (this.#watcherCount === 0) {
+      (async () => {
+        if (!this.#initialized) {
+          await this.init();
+        }
+
+        let resolvedOptions = nullthrows(this.#resolvedOptions);
+        let targetDirs = resolvedOptions.targets.map(target =>
+          path.resolve(target.distDir)
+        );
+        let cacheDir = path.resolve(resolvedOptions.cacheDir);
+        let vcsDirs = ['.git', '.hg'].map(dir =>
+          path.join(resolvedOptions.projectRoot, dir)
+        );
+        let ignore = [cacheDir, ...targetDirs, ...vcsDirs];
+        this.#watcherSubscription = await watcher.subscribe(
+          resolvedOptions.projectRoot,
+          (err, events) => {
+            if (err) {
+              this.#watchErrors.emit(err);
+              return;
+            }
+
+            this.#assetGraphBuilder.respondToFSEvents(events);
+            if (this.#assetGraphBuilder.isInvalid()) {
+              this.build().catch(err => {
+                if (!(err instanceof BuildError)) {
+                  this.#watchErrors.emit(err);
+                }
+                // If this is a BuildError, do nothing. In watch mode, reporters
+                // should alert the user something is broken, which allows Parcel
+                // to gracefully continue once the user makes the correct changes
+              });
+            }
+          },
+          {ignore}
+        );
+
+        return this.build();
+      })().catch(err => {
+        this.#watchErrors.emit(err);
+      });
+    }
+
+    this.#watcherCount++;
+
+    return {
+      unsubscribe: async () => {
+        if (buildEventsDisposable) {
+          buildEventsDisposable.dispose();
+        }
+        if (watchErrorsDisposable) {
+          watchErrorsDisposable.dispose();
+        }
+
+        this.#watcherCount--;
+        if (this.#watcherCount === 0) {
+          await this.#watcherSubscription.unsubscribe();
+        }
+      }
+    };
   }
 
   async build(): Promise<BundleGraph> {
@@ -168,7 +219,7 @@ export default class Parcel {
 
       await packageBundles(bundleGraph, this.#runPackage);
 
-      this.#reporterRunner.report({
+      let event = {
         type: 'buildSuccess',
         changedAssets: new Map(
           Array.from(changedAssets).map(([id, asset]) => [id, new Asset(asset)])
@@ -176,20 +227,19 @@ export default class Parcel {
         assetGraph: new MainAssetGraph(assetGraph),
         bundleGraph: new BundleGraph(bundleGraph),
         buildTime: Date.now() - startTime
-      });
-
-      let resolvedOptions = nullthrows(this.#resolvedOptions);
-      if (!resolvedOptions.watch && resolvedOptions.killWorkers !== false) {
-        await this.#farm.end();
-      }
+      };
+      this.#reporterRunner.report(event);
+      this.#buildEvents.emit(event);
 
       return new BundleGraph(bundleGraph);
     } catch (e) {
       if (!(e instanceof BuildAbortError)) {
-        await this.#reporterRunner.report({
+        let event = {
           type: 'buildFailure',
           error: e
-        });
+        };
+        await this.#reporterRunner.report(event);
+        this.#buildEvents.emit(event);
       }
 
       throw new BuildError(e);
